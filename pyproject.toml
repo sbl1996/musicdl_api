@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-musicdl-api = "musicdl_api.__main__:main"
+musicdl-api = "musicdl_api.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["musicdl_api"]

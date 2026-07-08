@@ -17,7 +17,6 @@ musicdl_api/
 ├── README.md
 ├── musicdl_api/
 │   ├── __init__.py
-│   ├── __main__.py
 │   ├── config.py
 │   ├── main.py
 │   ├── models.py
