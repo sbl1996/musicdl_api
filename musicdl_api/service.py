@@ -14,6 +14,8 @@ from .config import settings
 
 
 SearchQueryKey = tuple[str, tuple[str, ...]]
+ACTIVE_SEARCH_STATUSES = {"queued", "running"}
+TERMINAL_SEARCH_STATUSES = {"completed", "failed"}
 
 
 @contextlib.contextmanager
@@ -232,10 +234,12 @@ class SearchTaskStore:
         self.sessions = sessions
         self._lock = threading.Lock()
         self._tasks: dict[str, SearchTask] = {}
+        self._inflight_queries: dict[SearchQueryKey, str] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def create(self, keyword: str, sources: list[str]) -> SearchTask:
         now = _utcnow()
+        key = search_query_key(keyword, sources)
         task = SearchTask(
             search_id=f"search_{uuid.uuid4().hex}",
             status="queued",
@@ -245,7 +249,14 @@ class SearchTaskStore:
             updated_at=now,
         )
         with self._lock:
+            existing_search_id = self._inflight_queries.get(key)
+            if existing_search_id is not None:
+                existing_task = self._tasks.get(existing_search_id)
+                if existing_task is not None and existing_task.status in ACTIVE_SEARCH_STATUSES:
+                    return existing_task
+                self._inflight_queries.pop(key, None)
             self._tasks[task.search_id] = task
+            self._inflight_queries[key] = task.search_id
         self._executor.submit(self._run_task, task.search_id)
         return task
 
@@ -289,6 +300,10 @@ class SearchTaskStore:
             for key, value in changes.items():
                 setattr(task, key, value)
             task.updated_at = _utcnow()
+            if task.status in TERMINAL_SEARCH_STATUSES:
+                query_key = search_query_key(task.keyword, task.sources)
+                if self._inflight_queries.get(query_key) == search_id:
+                    self._inflight_queries.pop(query_key, None)
 
 
 class DownloadTaskStore:
