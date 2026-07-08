@@ -40,6 +40,9 @@ async def search(request: SearchRequest) -> dict:
     sources = request.sources or settings.default_sources
     if not sources:
         raise HTTPException(status_code=400, detail="No sources configured")
+    cached_session = state.sessions.get_by_query(request.keyword, sources)
+    if cached_session is not None:
+        return session_to_response(cached_session)
     items = await run_in_threadpool(state.facade.search, request.keyword, sources)
     session = state.sessions.create(
         keyword=request.keyword,
@@ -54,6 +57,14 @@ def create_search(request: SearchRequest) -> dict:
     sources = request.sources or settings.default_sources
     if not sources:
         raise HTTPException(status_code=400, detail="No sources configured")
+    cached_session = state.sessions.get_by_query(request.keyword, sources)
+    if cached_session is not None:
+        task = state.searches.create_completed(
+            keyword=request.keyword,
+            sources=sources,
+            session_id=cached_session.session_id,
+        )
+        return search_task_to_response(task, state.sessions)
     task = state.searches.create(keyword=request.keyword, sources=sources)
     return search_task_to_response(task, state.sessions)
 

@@ -13,6 +13,9 @@ from typing import Any
 from .config import settings
 
 
+SearchQueryKey = tuple[str, tuple[str, ...]]
+
+
 @contextlib.contextmanager
 def _suppress_console_output():
     stdout_fd = os.dup(1)
@@ -31,6 +34,11 @@ def _suppress_console_output():
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def search_query_key(keyword: str, sources: list[str]) -> SearchQueryKey:
+    return (keyword.strip(), tuple(sources))
+
 
 from musicdl.musicdl import MusicClient  # noqa: E402
 from musicdl.modules.utils.data import SongInfo  # noqa: E402
@@ -166,6 +174,7 @@ class SearchSessionStore:
         self.ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
         self._sessions: dict[str, SearchSession] = {}
+        self._query_index: dict[SearchQueryKey, str] = {}
 
     def create(self, keyword: str, sources: list[str], items: list[dict[str, Any]]) -> SearchSession:
         now = _utcnow()
@@ -180,12 +189,22 @@ class SearchSessionStore:
         with self._lock:
             self._evict_expired_locked(now)
             self._sessions[session.session_id] = session
+            self._query_index[search_query_key(keyword, sources)] = session.session_id
         return session
 
     def get(self, session_id: str) -> SearchSession | None:
         now = _utcnow()
         with self._lock:
             self._evict_expired_locked(now)
+            return self._sessions.get(session_id)
+
+    def get_by_query(self, keyword: str, sources: list[str]) -> SearchSession | None:
+        now = _utcnow()
+        with self._lock:
+            self._evict_expired_locked(now)
+            session_id = self._query_index.get(search_query_key(keyword, sources))
+            if session_id is None:
+                return None
             return self._sessions.get(session_id)
 
     def _evict_expired_locked(self, now: datetime) -> None:
@@ -195,7 +214,11 @@ class SearchSessionStore:
             if session.expires_at <= now
         ]
         for session_id in expired:
-            self._sessions.pop(session_id, None)
+            session = self._sessions.pop(session_id, None)
+            if session is not None:
+                key = search_query_key(session.keyword, session.sources)
+                if self._query_index.get(key) == session_id:
+                    self._query_index.pop(key, None)
 
 
 class SearchTaskStore:
@@ -224,6 +247,21 @@ class SearchTaskStore:
         with self._lock:
             self._tasks[task.search_id] = task
         self._executor.submit(self._run_task, task.search_id)
+        return task
+
+    def create_completed(self, keyword: str, sources: list[str], session_id: str) -> SearchTask:
+        now = _utcnow()
+        task = SearchTask(
+            search_id=f"search_{uuid.uuid4().hex}",
+            status="completed",
+            keyword=keyword,
+            sources=sources,
+            created_at=now,
+            updated_at=now,
+            session_id=session_id,
+        )
+        with self._lock:
+            self._tasks[task.search_id] = task
         return task
 
     def get(self, search_id: str) -> SearchTask | None:
