@@ -10,7 +10,7 @@ def _split_csv(value: str) -> list[str]:
 
 class Settings:
     def __init__(self) -> None:
-        root_dir = Path(__file__).resolve().parents[2]
+        root_dir = Path(__file__).resolve().parents[1]
         self.project_root = root_dir
         self.download_root = Path(
             os.environ.get(

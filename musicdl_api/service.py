@@ -17,22 +17,26 @@ SearchQueryKey = tuple[str, tuple[str, ...]]
 ACTIVE_SEARCH_STATUSES = {"queued", "running"}
 TERMINAL_SEARCH_STATUSES = {"completed", "failed"}
 REUSABLE_DOWNLOAD_STATUSES = {"queued", "running", "completed"}
+_console_output_lock = threading.RLock()
 
 
 @contextlib.contextmanager
 def _suppress_console_output():
-    stdout_fd = os.dup(1)
-    stderr_fd = os.dup(2)
-    try:
-        with open(os.devnull, "w") as devnull:
-            os.dup2(devnull.fileno(), 1)
-            os.dup2(devnull.fileno(), 2)
-            yield
-    finally:
-        os.dup2(stdout_fd, 1)
-        os.dup2(stderr_fd, 2)
-        os.close(stdout_fd)
-        os.close(stderr_fd)
+    # File descriptors 1 and 2 are process-wide. Serialize redirection so
+    # concurrent musicdl calls cannot restore each other's saved descriptors.
+    with _console_output_lock:
+        stdout_fd = os.dup(1)
+        stderr_fd = os.dup(2)
+        try:
+            with open(os.devnull, "w") as devnull:
+                os.dup2(devnull.fileno(), 1)
+                os.dup2(devnull.fileno(), 2)
+                yield
+        finally:
+            os.dup2(stdout_fd, 1)
+            os.dup2(stderr_fd, 2)
+            os.close(stdout_fd)
+            os.close(stderr_fd)
 
 
 def _utcnow() -> datetime:
@@ -435,8 +439,13 @@ def search_task_to_response(task: SearchTask, sessions: SearchSessionStore) -> d
 def task_to_response(task: DownloadTask) -> dict[str, Any]:
     downloaded_bytes = 0
     file_exists = False
-    if task.save_path:
-        save_path = Path(task.save_path)
+    current_save_path = (
+        task.result.get("savePath")
+        if task.status == "completed" and task.result
+        else task.save_path
+    )
+    if current_save_path:
+        save_path = Path(current_save_path)
         if save_path.exists():
             file_exists = True
             try:
@@ -455,7 +464,7 @@ def task_to_response(task: DownloadTask) -> dict[str, Any]:
         "updatedAt": task.updated_at,
         "error": task.error,
         "progress": {
-            "savePath": task.save_path,
+            "savePath": current_save_path,
             "fileExists": file_exists,
             "downloadedBytes": downloaded_bytes,
             "totalBytes": task.total_bytes,
