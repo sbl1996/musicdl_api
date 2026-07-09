@@ -16,6 +16,7 @@ from .config import settings
 SearchQueryKey = tuple[str, tuple[str, ...]]
 ACTIVE_SEARCH_STATUSES = {"queued", "running"}
 TERMINAL_SEARCH_STATUSES = {"completed", "failed"}
+REUSABLE_DOWNLOAD_STATUSES = {"queued", "running", "completed"}
 
 
 @contextlib.contextmanager
@@ -311,10 +312,12 @@ class DownloadTaskStore:
         self.facade = facade
         self._lock = threading.Lock()
         self._tasks: dict[str, DownloadTask] = {}
+        self._item_tasks: dict[tuple[str, str], str] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def create(self, session_id: str, item_id: str, item_data: dict[str, Any]) -> DownloadTask:
         now = _utcnow()
+        key = (session_id, item_id)
         song_info = SongInfo.fromdict(item_data["songInfo"])
         task_dir = self.facade.download_root / "tasks" / session_id / f"task_{uuid.uuid4().hex}"
         task_dir.mkdir(parents=True, exist_ok=True)
@@ -331,7 +334,14 @@ class DownloadTaskStore:
             total_bytes=item_data.get("fileSizeBytes"),
         )
         with self._lock:
+            existing_task_id = self._item_tasks.get(key)
+            if existing_task_id is not None:
+                existing_task = self._tasks.get(existing_task_id)
+                if existing_task is not None and self._is_reusable(existing_task):
+                    return existing_task
+                self._item_tasks.pop(key, None)
             self._tasks[task.task_id] = task
+            self._item_tasks[key] = task.task_id
         self._executor.submit(self._run_task, task.task_id, item_data)
         return task
 
@@ -359,6 +369,18 @@ class DownloadTaskStore:
             for key, value in changes.items():
                 setattr(task, key, value)
             task.updated_at = _utcnow()
+            if task.status == "failed":
+                key = (task.session_id, task.item_id)
+                if self._item_tasks.get(key) == task_id:
+                    self._item_tasks.pop(key, None)
+
+    def _is_reusable(self, task: DownloadTask) -> bool:
+        if task.status not in REUSABLE_DOWNLOAD_STATUSES:
+            return False
+        if task.status != "completed":
+            return True
+        candidate_path = task.result.get("savePath") if task.result else task.save_path
+        return bool(candidate_path and Path(candidate_path).is_file())
 
 
 class AppState:

@@ -37,13 +37,6 @@ Environment variables:
   - default: `900`
 - `MUSICDL_API_DEFAULT_SOURCES`: comma-separated source list
   - default: `NeteaseMusicClient,QianqianMusicClient,MiguMusicClient,QQMusicClient,KuwoMusicClient`
-- `MUSICDL_API_HOST`: bind host for the packaged runner
-  - default: `127.0.0.1`
-- `MUSICDL_API_PORT`: bind port for the packaged runner
-  - default: `8000`
-- `MUSICDL_API_RELOAD`: enable uvicorn reload in the packaged runner
-  - default: `false`
-
 ## Install
 
 ```bash
@@ -55,16 +48,26 @@ this package. The current code has been validated against `musicdl==2.13.0`.
 
 ## Run
 
-Using the package entrypoint:
-
-```bash
-MUSICDL_API_RELOAD=true musicdl-api
-```
-
-Using uvicorn directly:
-
 ```bash
 uvicorn musicdl_api.main:app --reload
+```
+
+## Deploy
+
+On a Linux server with `uv` and systemd installed:
+
+```bash
+bash deploy/deploy.sh
+```
+
+The script creates `.venv`, installs the package, and configures the systemd
+service at `http://localhost:8803`.
+
+Optional environment overrides can be placed in `/etc/default/musicdl-api`.
+After changing them, restart the service:
+
+```bash
+sudo systemctl restart musicdl-api
 ```
 
 ## API
