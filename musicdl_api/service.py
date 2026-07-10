@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -315,43 +316,96 @@ class DownloadTaskStore:
     def __init__(self, facade: MusicdlFacade, max_workers: int) -> None:
         self.facade = facade
         self._lock = threading.Lock()
+        self._maintenance_lock = threading.Lock()
         self._tasks: dict[str, DownloadTask] = {}
         self._item_tasks: dict[tuple[str, str], str] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def create(self, session_id: str, item_id: str, item_data: dict[str, Any]) -> DownloadTask:
-        now = _utcnow()
-        key = (session_id, item_id)
-        song_info = SongInfo.fromdict(item_data["songInfo"])
-        task_dir = self.facade.download_root / "tasks" / session_id / f"task_{uuid.uuid4().hex}"
-        task_dir.mkdir(parents=True, exist_ok=True)
-        song_info.work_dir = str(task_dir)
-        predicted_save_path = song_info.save_path
-        task = DownloadTask(
-            task_id=task_dir.name,
-            session_id=session_id,
-            item_id=item_id,
-            status="queued",
-            created_at=now,
-            updated_at=now,
-            save_path=predicted_save_path,
-            total_bytes=item_data.get("fileSizeBytes"),
-        )
-        with self._lock:
-            existing_task_id = self._item_tasks.get(key)
-            if existing_task_id is not None:
-                existing_task = self._tasks.get(existing_task_id)
-                if existing_task is not None and self._is_reusable(existing_task):
-                    return existing_task
-                self._item_tasks.pop(key, None)
-            self._tasks[task.task_id] = task
-            self._item_tasks[key] = task.task_id
-        self._executor.submit(self._run_task, task.task_id, item_data)
-        return task
+        with self._maintenance_lock:
+            now = _utcnow()
+            key = (session_id, item_id)
+            song_info = SongInfo.fromdict(item_data["songInfo"])
+            task_dir = self.facade.download_root / "tasks" / session_id / f"task_{uuid.uuid4().hex}"
+            task_dir.mkdir(parents=True, exist_ok=True)
+            song_info.work_dir = str(task_dir)
+            predicted_save_path = song_info.save_path
+            task = DownloadTask(
+                task_id=task_dir.name,
+                session_id=session_id,
+                item_id=item_id,
+                status="queued",
+                created_at=now,
+                updated_at=now,
+                save_path=predicted_save_path,
+                total_bytes=item_data.get("fileSizeBytes"),
+            )
+            with self._lock:
+                existing_task_id = self._item_tasks.get(key)
+                if existing_task_id is not None:
+                    existing_task = self._tasks.get(existing_task_id)
+                    if existing_task is not None and self._is_reusable(existing_task):
+                        return existing_task
+                    self._item_tasks.pop(key, None)
+                self._tasks[task.task_id] = task
+                self._item_tasks[key] = task.task_id
+            self._executor.submit(self._run_task, task.task_id, item_data)
+            return task
 
     def get(self, task_id: str) -> DownloadTask | None:
         with self._lock:
             return self._tasks.get(task_id)
+
+    def storage_usage(self) -> dict[str, int]:
+        return _directory_usage(self.facade.download_root)
+
+    def cleanup_completed(self) -> dict[str, int]:
+        """Remove managed task directories while preserving queued and running tasks."""
+        tasks_root = self.facade.download_root / "tasks"
+        with self._maintenance_lock:
+            with self._lock:
+                active_task_ids = {
+                    task.task_id
+                    for task in self._tasks.values()
+                    if task.status in {"queued", "running"}
+                }
+            deleted_bytes = 0
+            deleted_file_count = 0
+            deleted_task_count = 0
+            skipped_active_task_count = 0
+            if not tasks_root.is_dir():
+                return {
+                    "deletedBytes": 0,
+                    "deletedFileCount": 0,
+                    "deletedTaskCount": 0,
+                    "skippedActiveTaskCount": 0,
+                }
+            for task_dir in tasks_root.glob("*/task_*"):
+                if not task_dir.is_dir() or task_dir.is_symlink():
+                    continue
+                if task_dir.name in active_task_ids:
+                    skipped_active_task_count += 1
+                    continue
+                usage = _directory_usage(task_dir)
+                try:
+                    shutil.rmtree(task_dir)
+                except OSError:
+                    continue
+                deleted_bytes += usage["usedBytes"]
+                deleted_file_count += usage["fileCount"]
+                deleted_task_count += 1
+            for session_dir in tasks_root.iterdir():
+                if session_dir.is_dir() and not session_dir.is_symlink():
+                    try:
+                        session_dir.rmdir()
+                    except OSError:
+                        pass
+            return {
+                "deletedBytes": deleted_bytes,
+                "deletedFileCount": deleted_file_count,
+                "deletedTaskCount": deleted_task_count,
+                "skippedActiveTaskCount": skipped_active_task_count,
+            }
 
     def _run_task(self, task_id: str, item_data: dict[str, Any]) -> None:
         self._update(task_id, status="running")
@@ -400,6 +454,24 @@ class AppState:
             facade=self.facade,
             max_workers=settings.max_download_workers,
         )
+
+
+def _directory_usage(directory: Path) -> dict[str, int]:
+    used_bytes = 0
+    file_count = 0
+    if not directory.is_dir():
+        return {"usedBytes": used_bytes, "fileCount": file_count}
+    for root, _, files in os.walk(directory, followlinks=False):
+        for filename in files:
+            path = Path(root, filename)
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                used_bytes += path.stat().st_size
+                file_count += 1
+            except OSError:
+                continue
+    return {"usedBytes": used_bytes, "fileCount": file_count}
 
 
 def session_to_response(session: SearchSession) -> dict[str, Any]:

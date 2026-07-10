@@ -191,6 +191,33 @@ from the current output file size:
 }
 ```
 
+### `GET /downloads/storage`
+
+Returns the total size and number of regular files under
+`MUSICDL_API_DOWNLOAD_ROOT`:
+
+```json
+{
+  "usedBytes": 22156354,
+  "fileCount": 1
+}
+```
+
+### `DELETE /downloads/storage`
+
+Removes completed and failed song-download task directories under
+`MUSICDL_API_DOWNLOAD_ROOT/tasks/`. Queued and running tasks are preserved.
+The response reports the actual files and bytes removed:
+
+```json
+{
+  "deletedBytes": 22156354,
+  "deletedFileCount": 1,
+  "deletedTaskCount": 1,
+  "skippedActiveTaskCount": 0
+}
+```
+
 ### `GET /downloads/{task_id}/file`
 
 Returns the completed downloaded file as a binary response.

@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse
 from .config import settings
 from .models import (
     DownloadRequest,
+    DownloadCleanupResponse,
+    DownloadStorageResponse,
     DownloadTaskResponse,
     HealthResponse,
     SearchRequest,
@@ -97,6 +99,16 @@ def create_download(request: DownloadRequest) -> dict:
         item_data=item,
     )
     return task_to_response(task)
+
+
+@app.get("/downloads/storage", response_model=DownloadStorageResponse)
+def get_download_storage() -> dict:
+    return state.downloads.storage_usage()
+
+
+@app.delete("/downloads/storage", response_model=DownloadCleanupResponse)
+def cleanup_download_storage() -> dict:
+    return state.downloads.cleanup_completed()
 
 
 @app.get("/downloads/{task_id}", response_model=DownloadTaskResponse)

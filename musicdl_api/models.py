@@ -85,6 +85,18 @@ class DownloadTaskResponse(BaseModel):
     result: DownloadResult | None = None
 
 
+class DownloadStorageResponse(BaseModel):
+    used_bytes: int = Field(alias="usedBytes")
+    file_count: int = Field(alias="fileCount")
+
+
+class DownloadCleanupResponse(BaseModel):
+    deleted_bytes: int = Field(alias="deletedBytes")
+    deleted_file_count: int = Field(alias="deletedFileCount")
+    deleted_task_count: int = Field(alias="deletedTaskCount")
+    skipped_active_task_count: int = Field(alias="skippedActiveTaskCount")
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     download_root: str = Field(alias="downloadRoot")
