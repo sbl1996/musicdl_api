@@ -21,7 +21,7 @@ pytest
 # Deploy to the production server
 git push
 sleep 3
-ssh ark-1 "zsh -lic 'cd ~/Code/musicdl_api && git restore . && proxy_on && git pull && proxy_off && sleep 1 && bash deploy/deploy.sh'" # if the proxy fails, run `git pull` directly
+ssh cloud7 "zsh -lic 'cd ~/Code/musicdl_api && git restore . && proxy_on && git pull && proxy_off && sleep 1 && bash deploy/deploy.sh'" # if the proxy fails, run `git pull` directly
 ```
 
 ## Configuration
@@ -29,7 +29,7 @@ ssh ark-1 "zsh -lic 'cd ~/Code/musicdl_api && git restore . && proxy_on && git p
 All via environment variables (see `musicdl_api/config.py`), read once at import time into the `settings` singleton:
 
 - `MUSICDL_API_DOWNLOAD_ROOT` (default `<repo>/var/downloads`)
-- `MUSICDL_API_SESSION_TTL_SECONDS` (default `900`)
+- `MUSICDL_API_SESSION_TTL_SECONDS` (default `3600`)
 - `MUSICDL_API_DEFAULT_SOURCES` (CSV; default includes Netease/Qianqian/Migu/QQ/Kuwo clients)
 - `MUSICDL_API_MAX_DOWNLOAD_WORKERS` (default `2`)
 

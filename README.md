@@ -34,7 +34,7 @@ Environment variables:
 - `MUSICDL_API_DOWNLOAD_ROOT`: output root for downloads
   - default: `var/downloads`
 - `MUSICDL_API_SESSION_TTL_SECONDS`: search session TTL
-  - default: `900`
+  - default: `3600`
 - `MUSICDL_API_DEFAULT_SOURCES`: comma-separated source list
   - default: `NeteaseMusicClient,QianqianMusicClient,MiguMusicClient,QQMusicClient,KuwoMusicClient`
 ## Install

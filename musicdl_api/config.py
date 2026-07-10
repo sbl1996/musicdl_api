@@ -19,7 +19,7 @@ class Settings:
             )
         ).resolve()
         self.session_ttl_seconds = int(
-            os.environ.get("MUSICDL_API_SESSION_TTL_SECONDS", "900")
+            os.environ.get("MUSICDL_API_SESSION_TTL_SECONDS", "3600")
         )
         self.default_sources = _split_csv(
             os.environ.get(
