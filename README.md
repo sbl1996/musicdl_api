@@ -64,6 +64,23 @@ The script creates `.venv`, installs the package, and configures the systemd
 service at `http://localhost:8803`.
 
 Optional environment overrides can be placed in `/etc/default/musicdl-api`.
+The following limits are configured by default and can be overridden there:
+
+```bash
+MUSICDL_API_SEARCH_TIMEOUT_SECONDS=300
+MUSICDL_API_DOWNLOAD_TIMEOUT_SECONDS=900
+```
+
+Each musicdl search or download runs in an isolated child process. Its console
+output is discarded without affecting Uvicorn's access and error logs, which
+remain available through `journalctl -u musicdl-api`.
+
+Requests may override their respective default with a positive `timeoutSeconds`
+field. For example: `{"keyword":"numb","timeoutSeconds":180}` for either
+`POST /search` or `POST /searches`, and
+`{"sessionId":"...","itemId":"1","timeoutSeconds":1800}` for
+`POST /downloads`.
+
 After changing them, restart the service:
 
 ```bash

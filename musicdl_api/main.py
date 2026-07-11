@@ -43,7 +43,9 @@ async def search(request: SearchRequest) -> dict:
     cached_session = state.sessions.get_by_query(request.keyword, sources)
     if cached_session is not None:
         return session_to_response(cached_session)
-    items = await run_in_threadpool(state.facade.search, request.keyword, sources)
+    items = await run_in_threadpool(
+        state.facade.search, request.keyword, sources, request.timeout_seconds
+    )
     session = state.sessions.create(
         keyword=request.keyword,
         sources=sources,
@@ -65,7 +67,11 @@ def create_search(request: SearchRequest) -> dict:
             session_id=cached_session.session_id,
         )
         return search_task_to_response(task, state.sessions)
-    task = state.searches.create(keyword=request.keyword, sources=sources)
+    task = state.searches.create(
+        keyword=request.keyword,
+        sources=sources,
+        timeout_seconds=request.timeout_seconds,
+    )
     return search_task_to_response(task, state.sessions)
 
 
@@ -97,6 +103,7 @@ def create_download(request: DownloadRequest) -> dict:
         session_id=session.session_id,
         item_id=request.item_id,
         item_data=item,
+        timeout_seconds=request.timeout_seconds,
     )
     return task_to_response(task)
 

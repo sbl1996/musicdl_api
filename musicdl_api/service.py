@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import contextlib
+import multiprocessing
 import os
 import shutil
 import threading
@@ -18,28 +18,6 @@ SearchQueryKey = tuple[str, tuple[str, ...]]
 ACTIVE_SEARCH_STATUSES = {"queued", "running"}
 TERMINAL_SEARCH_STATUSES = {"completed", "failed"}
 REUSABLE_DOWNLOAD_STATUSES = {"queued", "running", "completed"}
-_console_output_lock = threading.RLock()
-
-
-@contextlib.contextmanager
-def _suppress_console_output():
-    # File descriptors 1 and 2 are process-wide. Serialize redirection so
-    # concurrent musicdl calls cannot restore each other's saved descriptors.
-    with _console_output_lock:
-        stdout_fd = os.dup(1)
-        stderr_fd = os.dup(2)
-        try:
-            with open(os.devnull, "w") as devnull:
-                os.dup2(devnull.fileno(), 1)
-                os.dup2(devnull.fileno(), 2)
-                yield
-        finally:
-            os.dup2(stdout_fd, 1)
-            os.dup2(stderr_fd, 2)
-            os.close(stdout_fd)
-            os.close(stderr_fd)
-
-
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -50,6 +28,143 @@ def search_query_key(keyword: str, sources: list[str]) -> SearchQueryKey:
 
 from musicdl.musicdl import MusicClient  # noqa: E402
 from musicdl.modules.utils.data import SongInfo  # noqa: E402
+
+
+class MusicdlWorkerError(RuntimeError):
+    """A musicdl worker failed, exited unexpectedly, or exceeded its timeout."""
+
+
+def _make_client(download_root: str, sources: list[str]) -> MusicClient:
+    return MusicClient(
+        music_sources=sources,
+        init_music_clients_cfg={
+            source: {
+                "work_dir": str(Path(download_root) / source),
+                "search_size_per_source": 5,
+            }
+            for source in sources
+        },
+    )
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _search_in_worker(download_root: str, keyword: str, sources: list[str]) -> list[dict[str, Any]]:
+    search_results = _make_client(download_root, sources).search(keyword=keyword)
+    flattened: list[dict[str, Any]] = []
+    item_index = 1
+    for source_items in search_results.values():
+        for song_info in source_items:
+            if not isinstance(song_info, SongInfo) or not song_info.with_valid_download_url:
+                continue
+            flattened.append(
+                {
+                    "itemId": str(item_index),
+                    "songName": song_info.song_name,
+                    "singers": song_info.singers,
+                    "album": song_info.album,
+                    "source": song_info.source,
+                    "rootSource": song_info.root_source,
+                    "fileSize": song_info.file_size,
+                    "fileSizeBytes": _coerce_int(song_info.file_size_bytes),
+                    "duration": song_info.duration,
+                    "durationSeconds": _coerce_int(song_info.duration_s),
+                    "extension": song_info.ext,
+                    "identifier": _coerce_str(song_info.identifier),
+                    "downloadProtocol": song_info.protocol,
+                    "coverUrl": _coerce_str(song_info.cover_url),
+                    "songInfo": song_info.todict(),
+                }
+            )
+            item_index += 1
+    return flattened
+
+
+def _download_in_worker(
+    download_root: str, item_data: dict[str, Any], session_id: str, task_id: str
+) -> dict[str, Any]:
+    song_info = SongInfo.fromdict(item_data["songInfo"])
+    task_dir = Path(download_root) / "tasks" / session_id / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    song_info.work_dir = str(task_dir)
+    downloaded = _make_client(download_root, [song_info.source]).download(song_infos=[song_info])
+    if not downloaded:
+        raise RuntimeError("musicdl returned no downloaded files")
+    output = downloaded[0]
+    return {
+        "songName": output.song_name,
+        "singers": output.singers,
+        "album": output.album,
+        "source": output.source,
+        "extension": output.ext,
+        "savePath": output.save_path,
+        "fileSize": output.file_size,
+        "duration": output.duration,
+    }
+
+
+def _musicdl_worker(connection: Any, operation: str, payload: dict[str, Any]) -> None:
+    """Run musicdl with isolated console fds, then return only serializable data."""
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            if operation == "search":
+                result = _search_in_worker(**payload)
+            elif operation == "download":
+                result = _download_in_worker(**payload)
+            else:
+                raise ValueError(f"Unsupported musicdl operation: {operation}")
+        connection.send((True, result))
+    except Exception as exc:
+        connection.send((False, f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
+
+
+def _run_musicdl_worker(
+    operation: str, payload: dict[str, Any], timeout_seconds: int
+) -> Any:
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_musicdl_worker,
+        args=(child_connection, operation, payload),
+        daemon=True,
+    )
+    process.start()
+    child_connection.close()
+    try:
+        if not parent_connection.poll(timeout_seconds):
+            raise TimeoutError(f"musicdl {operation} timed out after {timeout_seconds} seconds")
+        succeeded, value = parent_connection.recv()
+        if not succeeded:
+            raise MusicdlWorkerError(f"musicdl {operation} failed: {value}")
+        return value
+    except EOFError as exc:
+        raise MusicdlWorkerError(
+            f"musicdl {operation} worker exited without returning a result"
+        ) from exc
+    finally:
+        parent_connection.close()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
 
 
 @dataclass
@@ -70,6 +185,7 @@ class SearchTask:
     sources: list[str]
     created_at: datetime
     updated_at: datetime
+    timeout_seconds: int | None = None
     error: str | None = None
     session_id: str | None = None
 
@@ -94,87 +210,38 @@ class MusicdlFacade:
         self.download_root.mkdir(parents=True, exist_ok=True)
 
     def create_client(self, sources: list[str]) -> MusicClient:
-        init_music_clients_cfg = {
-            source: {
-                "work_dir": str(self.download_root / source),
-                "search_size_per_source": 5,
-            }
-            for source in sources
-        }
-        return MusicClient(
-            music_sources=sources,
-            init_music_clients_cfg=init_music_clients_cfg,
+        return _make_client(str(self.download_root), sources)
+
+    def search(
+        self, keyword: str, sources: list[str], timeout_seconds: int | None = None
+    ) -> list[dict[str, Any]]:
+        return _run_musicdl_worker(
+            "search",
+            {
+                "download_root": str(self.download_root),
+                "keyword": keyword,
+                "sources": sources,
+            },
+            timeout_seconds or settings.search_timeout_seconds,
         )
 
-    def search(self, keyword: str, sources: list[str]) -> list[dict[str, Any]]:
-        client = self.create_client(sources)
-        with _suppress_console_output():
-            search_results = client.search(keyword=keyword)
-        flattened: list[dict[str, Any]] = []
-        item_index = 1
-        for _, source_items in search_results.items():
-            for song_info in source_items:
-                if not isinstance(song_info, SongInfo) or not song_info.with_valid_download_url:
-                    continue
-                flattened.append(
-                    {
-                        "itemId": str(item_index),
-                        "songName": song_info.song_name,
-                        "singers": song_info.singers,
-                        "album": song_info.album,
-                        "source": song_info.source,
-                        "rootSource": song_info.root_source,
-                        "fileSize": song_info.file_size,
-                        "fileSizeBytes": self._coerce_int(song_info.file_size_bytes),
-                        "duration": song_info.duration,
-                        "durationSeconds": self._coerce_int(song_info.duration_s),
-                        "extension": song_info.ext,
-                        "identifier": self._coerce_str(song_info.identifier),
-                        "downloadProtocol": song_info.protocol,
-                        "coverUrl": self._coerce_str(song_info.cover_url),
-                        "songInfo": song_info.todict(),
-                    }
-                )
-                item_index += 1
-        return flattened
-
-    def download(self, item_data: dict[str, Any], session_id: str, task_id: str) -> dict[str, Any]:
-        song_info = SongInfo.fromdict(item_data["songInfo"])
-        task_dir = self.download_root / "tasks" / session_id / task_id
-        task_dir.mkdir(parents=True, exist_ok=True)
-        song_info.work_dir = str(task_dir)
-        client = self.create_client([song_info.source])
-        with _suppress_console_output():
-            downloaded = client.download(song_infos=[song_info])
-        if not downloaded:
-            raise RuntimeError("musicdl returned no downloaded files")
-        output = downloaded[0]
-        return {
-            "songName": output.song_name,
-            "singers": output.singers,
-            "album": output.album,
-            "source": output.source,
-            "extension": output.ext,
-            "savePath": output.save_path,
-            "fileSize": output.file_size,
-            "duration": output.duration,
-        }
-
-    @staticmethod
-    def _coerce_int(value: Any) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(round(float(value)))
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _coerce_str(value: Any) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
+    def download(
+        self,
+        item_data: dict[str, Any],
+        session_id: str,
+        task_id: str,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        return _run_musicdl_worker(
+            "download",
+            {
+                "download_root": str(self.download_root),
+                "item_data": item_data,
+                "session_id": session_id,
+                "task_id": task_id,
+            },
+            timeout_seconds or settings.download_timeout_seconds,
+        )
 
 
 class SearchSessionStore:
@@ -243,7 +310,9 @@ class SearchTaskStore:
         self._inflight_queries: dict[SearchQueryKey, str] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def create(self, keyword: str, sources: list[str]) -> SearchTask:
+    def create(
+        self, keyword: str, sources: list[str], timeout_seconds: int | None = None
+    ) -> SearchTask:
         now = _utcnow()
         key = search_query_key(keyword, sources)
         task = SearchTask(
@@ -253,6 +322,7 @@ class SearchTaskStore:
             sources=sources,
             created_at=now,
             updated_at=now,
+            timeout_seconds=timeout_seconds,
         )
         with self._lock:
             existing_search_id = self._inflight_queries.get(key)
@@ -290,7 +360,9 @@ class SearchTaskStore:
         try:
             task = self.get(search_id)
             assert task is not None
-            items = self.facade.search(task.keyword, task.sources)
+            items = self.facade.search(
+                task.keyword, task.sources, timeout_seconds=task.timeout_seconds
+            )
             session = self.sessions.create(
                 keyword=task.keyword,
                 sources=task.sources,
@@ -321,7 +393,13 @@ class DownloadTaskStore:
         self._item_tasks: dict[tuple[str, str], str] = {}
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
-    def create(self, session_id: str, item_id: str, item_data: dict[str, Any]) -> DownloadTask:
+    def create(
+        self,
+        session_id: str,
+        item_id: str,
+        item_data: dict[str, Any],
+        timeout_seconds: int | None = None,
+    ) -> DownloadTask:
         with self._maintenance_lock:
             now = _utcnow()
             key = (session_id, item_id)
@@ -349,7 +427,7 @@ class DownloadTaskStore:
                     self._item_tasks.pop(key, None)
                 self._tasks[task.task_id] = task
                 self._item_tasks[key] = task.task_id
-            self._executor.submit(self._run_task, task.task_id, item_data)
+            self._executor.submit(self._run_task, task.task_id, item_data, timeout_seconds)
             return task
 
     def get(self, task_id: str) -> DownloadTask | None:
@@ -407,7 +485,9 @@ class DownloadTaskStore:
                 "skippedActiveTaskCount": skipped_active_task_count,
             }
 
-    def _run_task(self, task_id: str, item_data: dict[str, Any]) -> None:
+    def _run_task(
+        self, task_id: str, item_data: dict[str, Any], timeout_seconds: int | None
+    ) -> None:
         self._update(task_id, status="running")
         try:
             task = self.get(task_id)
@@ -416,6 +496,7 @@ class DownloadTaskStore:
                 item_data=item_data,
                 session_id=task.session_id,
                 task_id=task.task_id,
+                timeout_seconds=timeout_seconds,
             )
             self._update(task_id, status="completed", result=result)
         except Exception as exc:

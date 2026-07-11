@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class SearchRequest(BaseModel):
     keyword: str = Field(min_length=1, max_length=200)
     sources: list[str] | None = None
+    timeout_seconds: int | None = Field(alias="timeoutSeconds", default=None, gt=0)
 
 
 class SearchItem(BaseModel):
@@ -52,6 +53,7 @@ class SearchTaskResponse(BaseModel):
 class DownloadRequest(BaseModel):
     session_id: str = Field(alias="sessionId", min_length=1)
     item_id: str = Field(alias="itemId", min_length=1)
+    timeout_seconds: int | None = Field(alias="timeoutSeconds", default=None, gt=0)
 
 
 class DownloadResult(BaseModel):
