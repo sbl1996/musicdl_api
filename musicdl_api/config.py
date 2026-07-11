@@ -15,6 +15,15 @@ def _positive_int(name: str, default: str) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    value = os.environ.get(name, str(default)).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
 class Settings:
     def __init__(self) -> None:
         root_dir = Path(__file__).resolve().parents[1]
@@ -43,6 +52,7 @@ class Settings:
         self.download_timeout_seconds = _positive_int(
             "MUSICDL_API_DOWNLOAD_TIMEOUT_SECONDS", "900"
         )
+        self.debug_logs_enabled = _boolean("MUSICDL_API_DEBUG_LOGS", True)
 
 
 settings = Settings()

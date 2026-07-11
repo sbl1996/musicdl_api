@@ -117,12 +117,17 @@ def _download_in_worker(
     }
 
 
-def _musicdl_worker(connection: Any, operation: str, payload: dict[str, Any]) -> None:
+def _musicdl_worker(
+    connection: Any, operation: str, payload: dict[str, Any], log_path: str | None
+) -> None:
     """Run musicdl with isolated console fds, then return only serializable data."""
     try:
-        with open(os.devnull, "w") as devnull:
-            os.dup2(devnull.fileno(), 1)
-            os.dup2(devnull.fileno(), 2)
+        output_path = Path(log_path) if log_path else Path(os.devnull)
+        if log_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8", buffering=1) as output:
+            os.dup2(output.fileno(), 1)
+            os.dup2(output.fileno(), 2)
             if operation == "search":
                 result = _search_in_worker(**payload)
             elif operation == "download":
@@ -137,13 +142,16 @@ def _musicdl_worker(connection: Any, operation: str, payload: dict[str, Any]) ->
 
 
 def _run_musicdl_worker(
-    operation: str, payload: dict[str, Any], timeout_seconds: int
+    operation: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    log_path: Path | None = None,
 ) -> Any:
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
     process = context.Process(
         target=_musicdl_worker,
-        args=(child_connection, operation, payload),
+        args=(child_connection, operation, payload, str(log_path) if log_path else None),
         daemon=True,
     )
     process.start()
@@ -213,7 +221,11 @@ class MusicdlFacade:
         return _make_client(str(self.download_root), sources)
 
     def search(
-        self, keyword: str, sources: list[str], timeout_seconds: int | None = None
+        self,
+        keyword: str,
+        sources: list[str],
+        timeout_seconds: int | None = None,
+        log_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return _run_musicdl_worker(
             "search",
@@ -223,6 +235,7 @@ class MusicdlFacade:
                 "sources": sources,
             },
             timeout_seconds or settings.search_timeout_seconds,
+            self._search_log_path(log_id or f"request_{uuid.uuid4().hex}"),
         )
 
     def download(
@@ -241,7 +254,18 @@ class MusicdlFacade:
                 "task_id": task_id,
             },
             timeout_seconds or settings.download_timeout_seconds,
+            self._download_log_path(session_id, task_id),
         )
+
+    def _search_log_path(self, log_id: str) -> Path | None:
+        if not settings.debug_logs_enabled:
+            return None
+        return self.download_root / "logs" / "searches" / f"{log_id}.log"
+
+    def _download_log_path(self, session_id: str, task_id: str) -> Path | None:
+        if not settings.debug_logs_enabled:
+            return None
+        return self.download_root / "tasks" / session_id / task_id / "musicdl.log"
 
 
 class SearchSessionStore:
@@ -361,7 +385,10 @@ class SearchTaskStore:
             task = self.get(search_id)
             assert task is not None
             items = self.facade.search(
-                task.keyword, task.sources, timeout_seconds=task.timeout_seconds
+                task.keyword,
+                task.sources,
+                timeout_seconds=task.timeout_seconds,
+                log_id=task.search_id,
             )
             session = self.sessions.create(
                 keyword=task.keyword,

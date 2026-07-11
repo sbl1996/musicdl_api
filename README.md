@@ -69,11 +69,15 @@ The following limits are configured by default and can be overridden there:
 ```bash
 MUSICDL_API_SEARCH_TIMEOUT_SECONDS=300
 MUSICDL_API_DOWNLOAD_TIMEOUT_SECONDS=900
+MUSICDL_API_DEBUG_LOGS=true
 ```
 
 Each musicdl search or download runs in an isolated child process. Its console
-output is discarded without affecting Uvicorn's access and error logs, which
-remain available through `journalctl -u musicdl-api`.
+output is recorded when `MUSICDL_API_DEBUG_LOGS` is enabled without affecting
+Uvicorn's access and error logs, which remain available through
+`journalctl -u musicdl-api`. Search logs are written to
+`$MUSICDL_API_DOWNLOAD_ROOT/logs/searches/<searchId>.log`; download logs are
+written to `$MUSICDL_API_DOWNLOAD_ROOT/tasks/<sessionId>/<taskId>/musicdl.log`.
 
 Requests may override their respective default with a positive `timeoutSeconds`
 field. For example: `{"keyword":"numb","timeoutSeconds":180}` for either
