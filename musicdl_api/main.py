@@ -4,7 +4,6 @@ import mimetypes
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from .config import settings
@@ -33,25 +32,6 @@ def health() -> dict:
         "sessionTtlSeconds": settings.session_ttl_seconds,
         "defaultSources": settings.default_sources,
     }
-
-
-@app.post("/search", response_model=SearchResponse)
-async def search(request: SearchRequest) -> dict:
-    sources = request.sources or settings.default_sources
-    if not sources:
-        raise HTTPException(status_code=400, detail="No sources configured")
-    cached_session = state.sessions.get_by_query(request.keyword, sources)
-    if cached_session is not None:
-        return session_to_response(cached_session)
-    items = await run_in_threadpool(
-        state.facade.search, request.keyword, sources, request.timeout_seconds
-    )
-    session = state.sessions.create(
-        keyword=request.keyword,
-        sources=sources,
-        items=items,
-    )
-    return session_to_response(session)
 
 
 @app.post("/searches", response_model=SearchTaskResponse, status_code=202)

@@ -80,8 +80,8 @@ Uvicorn's access and error logs, which remain available through
 written to `$MUSICDL_API_DOWNLOAD_ROOT/tasks/<sessionId>/<taskId>/musicdl.log`.
 
 Requests may override their respective default with a positive `timeoutSeconds`
-field. For example: `{"keyword":"numb","timeoutSeconds":180}` for either
-`POST /search` or `POST /searches`, and
+field. For example: `{"keyword":"numb","timeoutSeconds":180}` for
+`POST /searches`, and
 `{"sessionId":"...","itemId":"1","timeoutSeconds":1800}` for
 `POST /downloads`.
 
@@ -96,47 +96,6 @@ sudo systemctl restart musicdl-api
 ### `GET /health`
 
 Returns service health and resolved config.
-
-### `POST /search`
-
-Runs a synchronous search and returns a completed search session. This endpoint
-is kept for simple clients. For mobile or weak-network clients, prefer
-`POST /searches`.
-
-Request:
-
-```json
-{
-  "keyword": "halbmond",
-  "sources": [
-    "QQMusicClient",
-    "KuwoMusicClient"
-  ]
-}
-```
-
-`sources` is optional. If omitted, the service uses `MUSICDL_API_DEFAULT_SOURCES`.
-
-Response:
-
-```json
-{
-  "sessionId": "session_xxx",
-  "expiresAt": "2026-07-06T15:00:00Z",
-  "items": [
-    {
-      "itemId": "11",
-      "songName": "Halbmond",
-      "singers": "Active Planets",
-      "album": "xxx",
-      "source": "QQMusicClient",
-      "fileSize": "21.13 MB",
-      "duration": "00:05:52",
-      "extension": "flac"
-    }
-  ]
-}
-```
 
 ### `GET /sessions/{session_id}`
 
