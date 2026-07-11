@@ -47,7 +47,25 @@ class SearchTaskResponse(BaseModel):
     created_at: datetime = Field(alias="createdAt")
     updated_at: datetime = Field(alias="updatedAt")
     error: str | None = None
+    progress: "SearchProgress | None" = None
     result: SearchResponse | None = None
+
+
+class SearchProgressTask(BaseModel):
+    task_id: int = Field(alias="taskId")
+    description: str
+    completed: float
+    total: float | None = None
+    source: str | None = None
+    stage: str | None = None
+    current_item: int | None = Field(alias="currentItem", default=None)
+    page: int | None = None
+    indeterminate: bool = False
+
+
+class SearchProgress(BaseModel):
+    updated_at: datetime = Field(alias="updatedAt")
+    tasks: list[SearchProgressTask]
 
 
 class DownloadRequest(BaseModel):

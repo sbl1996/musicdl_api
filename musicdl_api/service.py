@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import re
 import shutil
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -28,10 +30,70 @@ def search_query_key(keyword: str, sources: list[str]) -> SearchQueryKey:
 
 from musicdl.musicdl import MusicClient  # noqa: E402
 from musicdl.modules.utils.data import SongInfo  # noqa: E402
+import musicdl.musicdl as musicdl_module  # noqa: E402
 
 
 class MusicdlWorkerError(RuntimeError):
     """A musicdl worker failed, exited unexpectedly, or exceeded its timeout."""
+
+
+_SOURCE_PROGRESS_RE = re.compile(r"^(?P<source>\w+)\.(?P<operation>_?search) >>>")
+_RESULT_PROGRESS_RE = re.compile(
+    r"process the (?P<item>\d+)(?:st|nd|rd|th) search result on page (?P<page>\d+)"
+)
+
+
+def _progress_task_snapshot(task_id: int, task: Any) -> dict[str, Any]:
+    """Normalize musicdl's Rich task into an API-safe progress event."""
+    description = task.description
+    snapshot: dict[str, Any] = {
+        "taskId": task_id,
+        "description": description,
+        "completed": task.completed,
+        "total": task.total,
+        "indeterminate": False,
+    }
+    if description.startswith("Search From Sources >>>"):
+        snapshot["stage"] = "sourceSearchUrls"
+        return snapshot
+    if match := _SOURCE_PROGRESS_RE.match(description):
+        snapshot["source"] = match["source"]
+        if match["operation"] == "_search":
+            snapshot["stage"] = "processingResults"
+            # musicdl sets total to the current item number for this task, so it
+            # is not a real denominator and must not be rendered as a percentage.
+            snapshot["total"] = None
+            snapshot["indeterminate"] = True
+            if result_match := _RESULT_PROGRESS_RE.search(description):
+                snapshot["currentItem"] = int(result_match["item"])
+                snapshot["page"] = int(result_match["page"])
+        else:
+            snapshot["stage"] = "sourceSearchUrls"
+    return snapshot
+
+
+def _reporting_progress_class(report_progress: Any) -> type[Any]:
+    """Create a Rich Progress subclass that exposes its live task snapshots."""
+    base_progress = musicdl_module.Progress
+
+    class ReportingProgress(base_progress):
+        def _report_task(self, task_id: int) -> None:
+            report_progress(_progress_task_snapshot(task_id, self.tasks[task_id]))
+
+        def add_task(self, *args: Any, **kwargs: Any) -> int:
+            task_id = super().add_task(*args, **kwargs)
+            self._report_task(task_id)
+            return task_id
+
+        def update(self, task_id: int, *args: Any, **kwargs: Any) -> None:
+            super().update(task_id, *args, **kwargs)
+            self._report_task(task_id)
+
+        def advance(self, task_id: int, advance: float = 1) -> None:
+            super().advance(task_id, advance)
+            self._report_task(task_id)
+
+    return ReportingProgress
 
 
 def _make_client(download_root: str, sources: list[str]) -> MusicClient:
@@ -121,7 +183,18 @@ def _musicdl_worker(
     connection: Any, operation: str, payload: dict[str, Any], log_path: str | None
 ) -> None:
     """Run musicdl with isolated console fds, then return only serializable data."""
+    connection_lock = threading.Lock()
+
+    def send(message: dict[str, Any]) -> None:
+        with connection_lock:
+            connection.send(message)
+
+    original_progress = musicdl_module.Progress
     try:
+        if operation == "search":
+            musicdl_module.Progress = _reporting_progress_class(
+                lambda progress: send({"type": "progress", "progress": progress})
+            )
         output_path = Path(log_path) if log_path else Path(os.devnull)
         if log_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,10 +207,11 @@ def _musicdl_worker(
                 result = _download_in_worker(**payload)
             else:
                 raise ValueError(f"Unsupported musicdl operation: {operation}")
-        connection.send((True, result))
+        send({"type": "result", "succeeded": True, "value": result})
     except Exception as exc:
-        connection.send((False, f"{type(exc).__name__}: {exc}"))
+        send({"type": "result", "succeeded": False, "value": f"{type(exc).__name__}: {exc}"})
     finally:
+        musicdl_module.Progress = original_progress
         connection.close()
 
 
@@ -146,6 +220,7 @@ def _run_musicdl_worker(
     payload: dict[str, Any],
     timeout_seconds: int,
     log_path: Path | None = None,
+    progress_callback: Any | None = None,
 ) -> Any:
     context = multiprocessing.get_context("spawn")
     parent_connection, child_connection = context.Pipe(duplex=False)
@@ -157,12 +232,25 @@ def _run_musicdl_worker(
     process.start()
     child_connection.close()
     try:
-        if not parent_connection.poll(timeout_seconds):
-            raise TimeoutError(f"musicdl {operation} timed out after {timeout_seconds} seconds")
-        succeeded, value = parent_connection.recv()
-        if not succeeded:
-            raise MusicdlWorkerError(f"musicdl {operation} failed: {value}")
-        return value
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                raise TimeoutError(f"musicdl {operation} timed out after {timeout_seconds} seconds")
+            if not parent_connection.poll(min(remaining_seconds, 0.25)):
+                if not process.is_alive():
+                    raise MusicdlWorkerError(
+                        f"musicdl {operation} worker exited without returning a result"
+                    )
+                continue
+            message = parent_connection.recv()
+            if message["type"] == "progress":
+                if progress_callback is not None:
+                    progress_callback(message["progress"])
+                continue
+            if not message["succeeded"]:
+                raise MusicdlWorkerError(f"musicdl {operation} failed: {message['value']}")
+            return message["value"]
     except EOFError as exc:
         raise MusicdlWorkerError(
             f"musicdl {operation} worker exited without returning a result"
@@ -194,6 +282,7 @@ class SearchTask:
     created_at: datetime
     updated_at: datetime
     timeout_seconds: int | None = None
+    progress: dict[int, dict[str, Any]] = field(default_factory=dict)
     error: str | None = None
     session_id: str | None = None
 
@@ -226,6 +315,7 @@ class MusicdlFacade:
         sources: list[str],
         timeout_seconds: int | None = None,
         log_id: str | None = None,
+        progress_callback: Any | None = None,
     ) -> list[dict[str, Any]]:
         return _run_musicdl_worker(
             "search",
@@ -236,6 +326,7 @@ class MusicdlFacade:
             },
             timeout_seconds or settings.search_timeout_seconds,
             self._search_log_path(log_id or f"request_{uuid.uuid4().hex}"),
+            progress_callback,
         )
 
     def download(
@@ -389,6 +480,7 @@ class SearchTaskStore:
                 task.sources,
                 timeout_seconds=task.timeout_seconds,
                 log_id=task.search_id,
+                progress_callback=lambda progress: self._update_progress(search_id, progress),
             )
             session = self.sessions.create(
                 keyword=task.keyword,
@@ -409,6 +501,14 @@ class SearchTaskStore:
                 query_key = search_query_key(task.keyword, task.sources)
                 if self._inflight_queries.get(query_key) == search_id:
                     self._inflight_queries.pop(query_key, None)
+
+    def _update_progress(self, search_id: str, progress: dict[str, Any]) -> None:
+        with self._lock:
+            task = self._tasks.get(search_id)
+            if task is None or task.status not in ACTIVE_SEARCH_STATUSES:
+                return
+            task.progress[progress["taskId"]] = progress
+            task.updated_at = _utcnow()
 
 
 class DownloadTaskStore:
@@ -612,6 +712,14 @@ def search_task_to_response(task: SearchTask, sessions: SearchSessionStore) -> d
         "createdAt": task.created_at,
         "updatedAt": task.updated_at,
         "error": task.error,
+        "progress": (
+            {
+                "updatedAt": task.updated_at,
+                "tasks": [task.progress[task_id] for task_id in sorted(task.progress)],
+            }
+            if task.progress
+            else None
+        ),
         "result": result,
     }
 
