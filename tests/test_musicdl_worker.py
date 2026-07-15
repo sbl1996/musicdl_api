@@ -3,6 +3,7 @@ import os
 import pytest
 
 from musicdl_api.service import (
+    MusicdlFacade,
     MusicdlWorkerError,
     _reporting_progress_class,
     _run_musicdl_worker,
@@ -76,3 +77,33 @@ def test_reporting_progress_marks_result_processing_as_indeterminate() -> None:
     assert events[-1]["page"] == 1
     assert events[-1]["total"] is None
     assert events[-1]["indeterminate"] is True
+
+
+def test_search_skips_failed_source_and_keeps_other_source_results(monkeypatch, tmp_path) -> None:
+    facade = MusicdlFacade()
+    facade.download_root = tmp_path
+    calls = []
+
+    def fake_worker(operation, payload, timeout_seconds, log_path, progress_callback):
+        source = payload["sources"][0]
+        calls.append((source, timeout_seconds, log_path))
+        if source == "BrokenMusicClient":
+            raise TimeoutError("timed out")
+        progress_callback({"taskId": 0, "description": "search"})
+        return [{"itemId": "1", "source": source, "songInfo": {}}]
+
+    monkeypatch.setattr("musicdl_api.service._run_musicdl_worker", fake_worker)
+
+    progress = []
+    items = facade.search(
+        "test",
+        ["WorkingMusicClient", "BrokenMusicClient"],
+        timeout_seconds=12,
+        log_id="search_test",
+        progress_callback=progress.append,
+    )
+
+    assert items == [{"itemId": "1", "source": "WorkingMusicClient", "songInfo": {}}]
+    assert {source for source, _, _ in calls} == {"WorkingMusicClient", "BrokenMusicClient"}
+    assert all(timeout == 12 for _, timeout, _ in calls)
+    assert progress == [{"taskId": 0, "description": "search", "source": "WorkingMusicClient"}]

@@ -7,7 +7,7 @@ import shutil
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -282,7 +282,7 @@ class SearchTask:
     created_at: datetime
     updated_at: datetime
     timeout_seconds: int | None = None
-    progress: dict[int, dict[str, Any]] = field(default_factory=dict)
+    progress: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     error: str | None = None
     session_id: str | None = None
 
@@ -317,17 +317,51 @@ class MusicdlFacade:
         log_id: str | None = None,
         progress_callback: Any | None = None,
     ) -> list[dict[str, Any]]:
-        return _run_musicdl_worker(
-            "search",
-            {
-                "download_root": str(self.download_root),
-                "keyword": keyword,
-                "sources": sources,
-            },
-            timeout_seconds or settings.search_timeout_seconds,
-            self._search_log_path(log_id or f"request_{uuid.uuid4().hex}"),
-            progress_callback,
-        )
+        """Search sources independently so one stalled provider cannot block the rest."""
+        sources = list(dict.fromkeys(sources))
+        source_timeout = timeout_seconds or settings.search_timeout_seconds
+        search_log_id = log_id or f"request_{uuid.uuid4().hex}"
+        results_by_source: dict[str, list[dict[str, Any]]] = {}
+
+        def search_source(source: str) -> tuple[str, list[dict[str, Any]]]:
+            def report(progress: dict[str, Any]) -> None:
+                if progress_callback is None:
+                    return
+                # Rich task IDs restart in each child process. The source keeps
+                # otherwise identical task IDs distinct in the API response.
+                progress_callback({**progress, "source": progress.get("source") or source})
+
+            return source, _run_musicdl_worker(
+                "search",
+                {
+                    "download_root": str(self.download_root),
+                    "keyword": keyword,
+                    "sources": [source],
+                },
+                source_timeout,
+                self._search_log_path(search_log_id, source),
+                report,
+            )
+
+        # Each worker has its own deadline. Failures, including timeouts, are
+        # deliberately isolated: successful sources still form a valid session.
+        with ThreadPoolExecutor(max_workers=min(len(sources), 10)) as executor:
+            futures = [executor.submit(search_source, source) for source in sources]
+            for future in as_completed(futures):
+                try:
+                    source, source_items = future.result()
+                except Exception:
+                    continue
+                results_by_source[source] = source_items
+
+        # Workers number their own items from 1. Renumber after merging to keep
+        # session item IDs unique and stable in the caller's source order.
+        items: list[dict[str, Any]] = []
+        for source in sources:
+            items.extend(results_by_source.get(source, []))
+        for item_index, item in enumerate(items, start=1):
+            item["itemId"] = str(item_index)
+        return items
 
     def download(
         self,
@@ -348,9 +382,12 @@ class MusicdlFacade:
             self._download_log_path(session_id, task_id),
         )
 
-    def _search_log_path(self, log_id: str) -> Path | None:
+    def _search_log_path(self, log_id: str, source: str | None = None) -> Path | None:
         if not settings.debug_logs_enabled:
             return None
+        if source is not None:
+            safe_source = re.sub(r"[^A-Za-z0-9_.-]", "_", source)
+            return self.download_root / "logs" / "searches" / log_id / f"{safe_source}.log"
         return self.download_root / "logs" / "searches" / f"{log_id}.log"
 
     def _download_log_path(self, session_id: str, task_id: str) -> Path | None:
@@ -507,7 +544,8 @@ class SearchTaskStore:
             task = self._tasks.get(search_id)
             if task is None or task.status not in ACTIVE_SEARCH_STATUSES:
                 return
-            task.progress[progress["taskId"]] = progress
+            progress_key = (progress.get("source") or "", progress["taskId"])
+            task.progress[progress_key] = progress
             task.updated_at = _utcnow()
 
 
